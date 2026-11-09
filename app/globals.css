@@ -1,14 +1,22 @@
 @import "tailwindcss";
 
 :root {
-  --background: #09090b;
-  --foreground: #fafafa;
-  color-scheme: dark light;
+  --background: #ffffff;
+  --foreground: #171717;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
 }
 
 body {
@@ -17,34 +25,8 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
-/* ============================================================
-   Samsung Internet Dark Mode Fix
-   ============================================================
-   Samsung Internet's "Force Dark Mode" aggressively inverts
-   canvas pixels and DOM element colors via a proprietary
-   browser-level filter. These rules prevent that engine from
-   touching our PDF page images.
-   ============================================================ */
-
-/* Prevent dark-mode from touching any rendered PDF page image */
+/* Preserve the PDF artwork when Samsung Internet applies a forced dark theme. */
 .pdf-page-image {
-  color-scheme: only light !important;
-  forced-color-adjust: none !important;
-  -webkit-filter: none !important;
-  filter: none !important;
-  -webkit-print-color-adjust: exact !important;
-  print-color-adjust: exact !important;
-  mix-blend-mode: normal !important;
-  opacity: 1 !important;
-  image-rendering: auto !important;
-}
-
-/* Container around each page — also guarded */
-.pdf-page-container {
-  color-scheme: only light !important;
-  forced-color-adjust: none !important;
-  -webkit-filter: none !important;
-  filter: none !important;
-  isolation: isolate;
-  contain: layout paint;
+  color-scheme: only light;
+  forced-color-adjust: none;
 }

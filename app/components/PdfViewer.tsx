@@ -1,189 +1,230 @@
 'use client';
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState, useCallback, useSyncExternalStore } from 'react';
+import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 
 interface PdfViewerProps {
   pdfUrl: string;
 }
 
-interface PageData {
-  blobUrl: string;
+interface PageImage {
+  url: string;
   width: number;
   height: number;
 }
 
-export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
-  const [isMounted, setIsMounted] = useState(false);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [numPages, setNumPages] = useState(0);
-  const [pageAspectRatios, setPageAspectRatios] = useState<Record<number, number>>({});
-  const [renderedPages, setRenderedPages] = useState<Record<number, PageData>>({});
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const pdfDocRef = useRef<any>(null);
-  const renderTasksRef = useRef<Record<number, any>>({});
-  const blobUrlsRef = useRef<string[]>([]);
+const subscribeToBrowser = () => () => {};
+const getBrowserUserAgent = () => navigator.userAgent;
+const getServerUserAgent = () => null;
 
-  useEffect(() => {
-    setIsMounted(true);
-    return () => {
-      // Revoke all blob URLs on unmount to free memory
-      blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-      blobUrlsRef.current = [];
-    };
+export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
+  const userAgent = useSyncExternalStore(subscribeToBrowser, getBrowserUserAgent, getServerUserAgent);
+  const isMounted = userAgent !== null;
+  const usePageImages = /SamsungBrowser\//i.test(userAgent ?? '');
+  const [pageImages, setPageImages] = useState<Record<number, PageImage>>({});
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
+  const numPages = pdfDoc?.numPages ?? 0;
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+  const renderTasksRef = useRef<Record<number, RenderTask>>({});
+  const canvasRefs = useRef<{ [pageIndex: number]: HTMLCanvasElement | null }>({});
+  const imageUrlsRef = useRef<Record<number, string>>({});
+  const renderGenerationRef = useRef(0);
+
+  const cancelRendering = useCallback(() => {
+    ++renderGenerationRef.current;
+    Object.values(renderTasksRef.current).forEach((task) => task.cancel());
   }, []);
 
-  const renderPages = useCallback(async (pdfDoc: any) => {
-    if (!containerRef.current || !pdfDoc) return;
+  const renderPages = useCallback(
+    async (pdfDoc: PDFDocumentProxy) => {
+      if (!containerRef.current || !pdfDoc) return;
 
-    const containerWidth = containerRef.current.clientWidth;
-    if (containerWidth <= 0) return;
+      const containerWidth = containerRef.current.clientWidth;
+      if (containerWidth <= 0) return;
 
-    const targetWidth = Math.min(containerWidth, 1200);
-    const dpr = window.devicePixelRatio || 1;
+      // Fit to container width on mobile; cap on extra-large screens for readability
+      const targetWidth = Math.min(containerWidth, 1200);
+      const dpr = usePageImages
+        ? Math.min(window.devicePixelRatio || 1, 2)
+        : window.devicePixelRatio || 1;
+      const generation = ++renderGenerationRef.current;
+      const isCurrent = () => generation === renderGenerationRef.current;
 
-    // Cancel ongoing renders
-    Object.values(renderTasksRef.current).forEach((task) => {
-      try { task?.cancel(); } catch { /* ignore */ }
-    });
-    renderTasksRef.current = {};
+      // Cancel any ongoing renders
+      const previousTasks = Object.values(renderTasksRef.current);
+      previousTasks.forEach((task) => {
+        try {
+          task?.cancel();
+        } catch {
+          // Ignore cancellation errors
+        }
+      });
+      renderTasksRef.current = {};
+      // PDF.js must finish cancelling before a canvas can be reused.
+      await Promise.allSettled(previousTasks.map((task) => task.promise));
 
-    // Revoke old blob URLs before creating new ones
-    blobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-    blobUrlsRef.current = [];
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        if (!isCurrent()) return;
+        // Keep Samsung's PDF canvas out of the DOM; display the resulting PNG.
+        const canvas = usePageImages
+          ? document.createElement('canvas')
+          : canvasRefs.current[i];
+        if (!canvas) continue;
 
-    for (let i = 1; i <= pdfDoc.numPages; i++) {
-      try {
-        const page = await pdfDoc.getPage(i);
-        const unscaledViewport = page.getViewport({ scale: 1 });
-        const scale = targetWidth / unscaledViewport.width;
-        const viewport = page.getViewport({ scale: scale * dpr });
+        try {
+          const page = await pdfDoc.getPage(i);
+          if (!isCurrent()) return;
+          const unscaledViewport = page.getViewport({ scale: 1 });
+          const scale = targetWidth / unscaledViewport.width;
+          // Bound Samsung's bitmap allocation on high-DPI phones and long pages.
+          const outputScale = usePageImages
+            ? Math.min(
+                dpr,
+                4096 / targetWidth,
+                4096 / (unscaledViewport.height * scale),
+                Math.sqrt(4_000_000 / (targetWidth * unscaledViewport.height * scale)),
+              )
+            : dpr;
+          const viewport = page.getViewport({ scale: scale * outputScale });
 
-        // --- Offscreen canvas: never attached to the DOM ---
-        const canvas = document.createElement('canvas');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) continue;
+          const context = canvas.getContext('2d', { alpha: false });
+          if (!context) throw new Error('Unable to create a menu page canvas.');
 
-        // 1. Solid white pre-fill (prevents transparent→black on some GPUs)
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          canvas.style.width = `${targetWidth}px`;
+          canvas.style.height = `${viewport.height / outputScale}px`;
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
 
-        // 2. Render PDF page with explicit white background
-        const renderTask = page.render({
-          canvasContext: ctx,
-          viewport,
-          background: 'rgb(255,255,255)',
-        });
-        renderTasksRef.current[i] = renderTask;
-        await renderTask.promise;
+          const renderContext = {
+            canvas: null,
+            canvasContext: context,
+            viewport: viewport,
+            background: '#ffffff',
+          };
 
-        // 3. Convert canvas → Blob → Object URL
-        //    Blob URLs are treated as true image resources by ALL browsers,
-        //    including Samsung Internet's dark mode engine, which never
-        //    inverts real image resources (it would break every photo on the web).
-        const blob: Blob = await new Promise((resolve) => {
-          canvas.toBlob((b) => resolve(b!), 'image/png');
-        });
-        const blobUrl = URL.createObjectURL(blob);
-        blobUrlsRef.current.push(blobUrl);
+          const renderTask = page.render(renderContext);
+          renderTasksRef.current[i] = renderTask;
 
-        const displayHeight = Math.round(viewport.height / dpr);
+          await renderTask.promise;
+          if (!isCurrent()) return;
 
-        setRenderedPages((prev) => ({
-          ...prev,
-          [i]: { blobUrl, width: targetWidth, height: displayHeight },
-        }));
-      } catch (err: any) {
-        if (err?.name !== 'RenderingCancelledException') {
-          console.error(`Error rendering page ${i}:`, err);
+          if (usePageImages) {
+            const blob = await new Promise<Blob>((resolve, reject) => {
+              canvas.toBlob((value) => {
+                if (value) resolve(value);
+                else reject(new Error('Unable to create menu page image.'));
+              }, 'image/png');
+            });
+            if (!isCurrent()) return;
+
+            const url = URL.createObjectURL(blob);
+            const previousUrl = imageUrlsRef.current[i];
+            imageUrlsRef.current[i] = url;
+            setPageImages((previous) => ({
+              ...previous,
+              [i]: { url, width: targetWidth, height: viewport.height / outputScale },
+            }));
+            if (previousUrl) URL.revokeObjectURL(previousUrl);
+          }
+        } catch (err: unknown) {
+          if (isCurrent() && !(err instanceof Error && err.name === 'RenderingCancelledException')) {
+            console.error(`Error rendering page ${i}:`, err);
+            setError('Unable to display a menu page. Please refresh.');
+          }
+        } finally {
+          if (usePageImages) {
+            canvas.width = 0;
+            canvas.height = 0;
+          }
         }
       }
-    }
-  }, []);
+    },
+    [usePageImages]
+  );
 
-  // Load PDF document
   useEffect(() => {
     if (!isMounted) return;
 
-    let cancelled = false;
+    let isCancelled = false;
+    let loadingTask: ReturnType<typeof import('pdfjs-dist').getDocument> | undefined;
 
-    (async () => {
+    async function loadPdf() {
       setIsLoading(true);
       setError(null);
+      setPdfDoc(null);
+      setPageImages({});
 
       try {
         const pdfjs = await import('pdfjs-dist');
-        pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
-
-        const doc = await pdfjs.getDocument({
-          url: pdfUrl,
-          cMapUrl: `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjs.version}/cmaps/`,
-          cMapPacked: true,
-        }).promise;
-
-        if (cancelled) return;
-
-        pdfDocRef.current = doc;
-        setNumPages(doc.numPages);
-
-        // Pre-fetch aspect ratios for layout placeholders
-        const ratios: Record<number, number> = {};
-        for (let i = 1; i <= doc.numPages; i++) {
-          try {
-            const p = await doc.getPage(i);
-            const v = p.getViewport({ scale: 1 });
-            ratios[i] = v.height / v.width;
-          } catch {
-            ratios[i] = 1.414; // A4 fallback
-          }
+        if (isCancelled) return;
+        if (pdfjs.GlobalWorkerOptions) {
+          pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
         }
-        setPageAspectRatios(ratios);
+
+        loadingTask = pdfjs.getDocument({
+          url: pdfUrl,
+          cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@' + pdfjs.version + '/cmaps/',
+          cMapPacked: true,
+          // Use PDF.js's software image conversion on Samsung Internet.
+          ...(usePageImages && {
+            isOffscreenCanvasSupported: false,
+            isImageDecoderSupported: false,
+          }),
+        });
+
+        const doc = await loadingTask.promise;
+        if (isCancelled) return;
+
+        setPdfDoc(doc);
         setIsLoading(false);
-      } catch (err: any) {
-        if (!cancelled) {
-          console.error('Failed to load PDF:', err);
+      } catch (err: unknown) {
+        if (!isCancelled) {
+          console.error('Failed to load PDF document:', err);
           setError('Unable to load menu. Please refresh.');
           setIsLoading(false);
         }
       }
-    })();
+    }
+
+    loadPdf();
 
     return () => {
-      cancelled = true;
-      Object.values(renderTasksRef.current).forEach((t) => {
-        try { t?.cancel(); } catch { /* ignore */ }
-      });
-      pdfDocRef.current?.destroy?.();
-      pdfDocRef.current = null;
+      isCancelled = true;
+      cancelRendering();
+      void loadingTask?.destroy();
+      Object.values(imageUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+      imageUrlsRef.current = {};
     };
-  }, [isMounted, pdfUrl]);
+  }, [isMounted, pdfUrl, usePageImages, cancelRendering]);
 
-  // Render pages once loaded & re-render on resize
   useEffect(() => {
-    if (!isMounted || numPages === 0 || !pdfDocRef.current) return;
+    if (!isMounted || !pdfDoc) return;
 
-    renderPages(pdfDocRef.current);
+    renderPages(pdfDoc);
 
-    let timeout: ReturnType<typeof setTimeout>;
-    const onResize = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(() => {
-        if (pdfDocRef.current) renderPages(pdfDocRef.current);
-      }, 200);
+    let timeoutId: NodeJS.Timeout;
+    const handleResize = () => {
+      clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => {
+        renderPages(pdfDoc);
+      }, 150);
     };
 
-    window.addEventListener('resize', onResize);
-    window.addEventListener('orientationchange', onResize);
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
+
     return () => {
-      clearTimeout(timeout);
-      window.removeEventListener('resize', onResize);
-      window.removeEventListener('orientationchange', onResize);
+      cancelRendering();
+      clearTimeout(timeoutId);
+      window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
     };
-  }, [isMounted, numPages, renderPages]);
+  }, [isMounted, pdfDoc, renderPages, cancelRendering]);
 
-  // --- SSR / pre-mount spinner ---
   if (!isMounted) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950">
@@ -198,60 +239,53 @@ export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
       className="w-full min-h-screen bg-zinc-950 flex flex-col items-center justify-start overflow-x-hidden selection:bg-transparent"
       style={{ WebkitOverflowScrolling: 'touch' }}
     >
-      {/* Loading */}
+      {/* Minimal neutral loading indicator */}
       {isLoading && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950">
-          <div className="w-8 h-8 rounded-full border-2 border-zinc-700 border-t-zinc-200 animate-spin" />
+          <div className="flex flex-col items-center gap-3">
+            <div className="w-8 h-8 rounded-full border-2 border-zinc-700 border-t-zinc-200 animate-spin" />
+          </div>
         </div>
       )}
 
-      {/* Error */}
+      {/* Error state */}
       {error && !isLoading && (
         <div className="flex-1 flex items-center justify-center p-6 text-zinc-400 text-sm">
           {error}
         </div>
       )}
 
-      {/* PDF Pages — rendered as <img> with Blob URLs for Samsung compatibility */}
-      <div className="w-full flex flex-col items-center gap-1 sm:gap-3 py-0 sm:py-2">
-        {Array.from({ length: numPages }, (_, idx) => {
-          const pageNum = idx + 1;
-          const pd = renderedPages[pageNum];
-          const ratio = pageAspectRatios[pageNum] || 1.414;
-
+      {/* Pages Container - 100% natural vertical scroll, zero toolbar, zero branding */}
+      <div className="w-full flex flex-col items-center gap-2 sm:gap-4 py-0 sm:py-2">
+        {Array.from({ length: numPages }, (_, index) => {
+          const pageNum = index + 1;
+          const pageImage = pageImages[pageNum];
           return (
             <div
               key={pageNum}
-              className="pdf-page-container w-full flex justify-center shadow-lg"
-              style={{
-                backgroundColor: '#ffffff',
-                minHeight: pd ? pd.height : undefined,
-              }}
+              className="w-full flex justify-center shadow-lg bg-zinc-900"
             >
-              {pd ? (
-                <img
-                  src={pd.blobUrl}
-                  width={pd.width}
-                  height={pd.height}
-                  alt=""
-                  draggable={false}
-                  className="pdf-page-image block max-w-full h-auto"
-                  style={{
-                    width: pd.width,
-                    height: pd.height,
-                    backgroundColor: '#ffffff',
-                    WebkitTouchCallout: 'none',
-                    userSelect: 'none',
-                    pointerEvents: 'none',
-                  }}
-                />
+              {usePageImages ? (
+                pageImage ? (
+                  // Blob URLs are generated locally; Next Image optimization is unnecessary.
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={pageImage.url}
+                    width={pageImage.width}
+                    height={pageImage.height}
+                    alt={`Menu page ${pageNum}`}
+                    draggable={false}
+                    className="pdf-page-image block max-w-full h-auto bg-white"
+                  />
+                ) : (
+                  <div className="w-full max-w-[1200px] aspect-[1/1.414] bg-zinc-900 animate-pulse" />
+                )
               ) : (
-                <div
-                  className="w-full max-w-[1200px] animate-pulse"
-                  style={{
-                    aspectRatio: `1 / ${ratio}`,
-                    backgroundColor: '#e4e4e7',
+                <canvas
+                  ref={(el) => {
+                    canvasRefs.current[pageNum] = el;
                   }}
+                  className="block max-w-full h-auto bg-white"
                 />
               )}
             </div>
