@@ -159,10 +159,16 @@ export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
       setPageImages({});
 
       try {
-        const pdfjs = await import('pdfjs-dist');
+        // The standard build requires newer JavaScript APIs than some Samsung
+        // Internet releases provide. The legacy build supplies their polyfills.
+        const pdfjs = usePageImages
+          ? await import('pdfjs-dist/legacy/build/pdf.mjs')
+          : await import('pdfjs-dist');
         if (isCancelled) return;
         if (pdfjs.GlobalWorkerOptions) {
-          pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.min.mjs';
+          pdfjs.GlobalWorkerOptions.workerSrc = usePageImages
+            ? `/pdf.worker.legacy.min.mjs?v=${pdfjs.version}`
+            : '/pdf.worker.min.mjs';
         }
 
         loadingTask = pdfjs.getDocument({
