@@ -6,15 +6,22 @@ interface PdfViewerProps {
   pdfUrl: string;
 }
 
+interface PageData {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
 export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
   const [isMounted, setIsMounted] = useState<boolean>(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const [numPages, setNumPages] = useState<number>(0);
+  const [pageAspectRatios, setPageAspectRatios] = useState<{ [pageNum: number]: number }>({});
+  const [renderedPages, setRenderedPages] = useState<{ [pageNum: number]: PageData }>({});
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const pdfDocRef = useRef<any>(null);
   const renderTasksRef = useRef<{ [pageIndex: number]: any }>({});
-  const canvasRefs = useRef<{ [pageIndex: number]: HTMLCanvasElement | null }>({});
 
   useEffect(() => {
     setIsMounted(true);
@@ -42,32 +49,51 @@ export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
       renderTasksRef.current = {};
 
       for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const canvas = canvasRefs.current[i];
-        if (!canvas) continue;
-
         try {
           const page = await pdfDoc.getPage(i);
           const unscaledViewport = page.getViewport({ scale: 1 });
           const scale = targetWidth / unscaledViewport.width;
           const viewport = page.getViewport({ scale: scale * dpr });
 
-          const context = canvas.getContext('2d', { alpha: false });
-          if (!context) continue;
-
+          // Create an offscreen canvas
+          const canvas = document.createElement('canvas');
           canvas.width = viewport.width;
           canvas.height = viewport.height;
-          canvas.style.width = `${targetWidth}px`;
-          canvas.style.height = `${viewport.height / dpr}px`;
 
+          const context = canvas.getContext('2d', { willReadFrequently: false });
+          if (!context) continue;
+
+          // 1. Explicitly fill with solid white background.
+          // This prevents Samsung Internet and other browsers from leaving transparent areas black.
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+
+          // 2. Render with PDF.js background set to white
           const renderContext = {
             canvasContext: context,
             viewport: viewport,
+            background: 'rgb(255, 255, 255)',
           };
 
           const renderTask = page.render(renderContext);
           renderTasksRef.current[i] = renderTask;
 
           await renderTask.promise;
+
+          // 3. Convert to high-resolution JPEG raster image.
+          // Mobile browsers (specifically Samsung Internet's Dark Mode) will NOT invert
+          // or black out <img> raster elements like they do with raw <canvas> elements.
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+          const displayHeight = Math.round(viewport.height / dpr);
+
+          setRenderedPages((prev) => ({
+            ...prev,
+            [i]: {
+              dataUrl,
+              width: targetWidth,
+              height: displayHeight,
+            },
+          }));
         } catch (err: any) {
           if (err?.name !== 'RenderingCancelledException') {
             console.error(`Error rendering page ${i}:`, err);
@@ -104,6 +130,19 @@ export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
 
         pdfDocRef.current = doc;
         setNumPages(doc.numPages);
+
+        // Pre-fetch aspect ratios for smooth layout sizing before image loads
+        const ratios: { [pageNum: number]: number } = {};
+        for (let i = 1; i <= Math.min(doc.numPages, 5); i++) {
+          try {
+            const p = await doc.getPage(i);
+            const v = p.getViewport({ scale: 1 });
+            ratios[i] = v.height / v.width;
+          } catch {
+            ratios[i] = 1.414; // Default A4 ratio fallback
+          }
+        }
+        setPageAspectRatios(ratios);
         setIsLoading(false);
       } catch (err: any) {
         if (!isCancelled) {
@@ -169,7 +208,10 @@ export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
     <div
       ref={containerRef}
       className="w-full min-h-screen bg-zinc-950 flex flex-col items-center justify-start overflow-x-hidden selection:bg-transparent"
-      style={{ WebkitOverflowScrolling: 'touch' }}
+      style={{
+        WebkitOverflowScrolling: 'touch',
+        colorScheme: 'light dark',
+      }}
     >
       {/* Minimal neutral loading indicator */}
       {isLoading && (
@@ -187,21 +229,46 @@ export default function PdfViewer({ pdfUrl }: PdfViewerProps) {
         </div>
       )}
 
-      {/* Pages Container - 100% natural vertical scroll, zero toolbar, zero branding */}
+      {/* Pages Container - 100% natural vertical scroll, immune to dark-mode canvas inversion */}
       <div className="w-full flex flex-col items-center gap-2 sm:gap-4 py-0 sm:py-2">
         {Array.from({ length: numPages }, (_, index) => {
           const pageNum = index + 1;
+          const pageData = renderedPages[pageNum];
+          const estimatedRatio = pageAspectRatios[pageNum] || 1.414;
+
           return (
             <div
               key={pageNum}
               className="w-full flex justify-center shadow-lg bg-zinc-900"
+              style={{
+                minHeight: pageData ? `${pageData.height}px` : undefined,
+              }}
             >
-              <canvas
-                ref={(el) => {
-                  canvasRefs.current[pageNum] = el;
-                }}
-                className="block max-w-full h-auto bg-white"
-              />
+              {pageData ? (
+                /* Rendered as an <img> raster to prevent Samsung Internet Dark Mode canvas inversion */
+                <img
+                  src={pageData.dataUrl}
+                  alt={`Page ${pageNum}`}
+                  className="block max-w-full h-auto bg-white select-none pointer-events-none"
+                  style={{
+                    width: `${pageData.width}px`,
+                    height: `${pageData.height}px`,
+                    colorScheme: 'only light',
+                    forcedColorAdjust: 'none',
+                    WebkitTouchCallout: 'none',
+                    userSelect: 'none',
+                  }}
+                  draggable={false}
+                />
+              ) : (
+                /* Subtle placeholder until page raster finishes */
+                <div
+                  className="w-full max-w-[1200px] bg-zinc-900 animate-pulse"
+                  style={{
+                    aspectRatio: `${1 / estimatedRatio}`,
+                  }}
+                />
+              )}
             </div>
           );
         })}
